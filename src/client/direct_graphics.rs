@@ -15,28 +15,48 @@ pub(super) struct Response {
 pub(super) struct ResponseMatcher {
     expected: Option<(u64, u32, Option<std::time::Instant>)>,
     retired: Option<(u32, std::time::Instant)>,
+    /// A second reply to an already completed fenced transfer.
+    duplicate: Option<(u32, std::time::Instant)>,
+    /// The host answers queries but not transmits, so every upload is followed
+    /// by a query for the same file and its reply completes the transfer.
+    query_fence: bool,
     active: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl ResponseMatcher {
+    pub(super) fn with_query_fence(query_fence: bool) -> Self {
+        Self {
+            query_fence,
+            ..Self::default()
+        }
+    }
+
+    pub(super) fn query_fence(&self) -> bool {
+        self.query_fence
+    }
+
     pub(super) fn active_handle(&self) -> std::sync::Arc<std::sync::atomic::AtomicBool> {
         self.active.clone()
     }
 
     fn refresh_active(&self) {
         self.active.store(
-            self.expected.is_some() || self.retired.is_some(),
+            self.expected.is_some() || self.retired.is_some() || self.duplicate.is_some(),
             std::sync::atomic::Ordering::Release,
         );
     }
     pub(super) fn interested(&mut self) -> bool {
         self.expire();
-        self.expected.is_some() || self.retired.is_some()
+        self.expected.is_some() || self.retired.is_some() || self.duplicate.is_some()
     }
     pub(super) fn arm(&mut self, transfer_id: u64, image_id: u32) -> bool {
         self.expire();
         if self.expected.is_some() {
             return false;
+        }
+        if self.duplicate.is_some_and(|(id, _)| id == image_id) {
+            // The new transfer's reply must never be drained as a duplicate.
+            self.duplicate = None;
         }
         self.expected = Some((transfer_id, image_id, None));
         self.refresh_active();
@@ -87,6 +107,9 @@ impl ResponseMatcher {
         if self.retired.is_some_and(|(_, deadline)| deadline <= now) {
             self.retired = None;
         }
+        if self.duplicate.is_some_and(|(_, deadline)| deadline <= now) {
+            self.duplicate = None;
+        }
         self.refresh_active();
     }
 
@@ -107,11 +130,22 @@ impl ResponseMatcher {
                 return Some(None);
             }
         }
+        if let Some((duplicate_id, _)) = self.duplicate {
+            if matching_response_controls(&payload[..separator], duplicate_id) {
+                self.duplicate = None;
+                self.refresh_active();
+                return Some(None);
+            }
+        }
         let (transfer_id, image_id, _) = self.expected?;
         if !matching_response_controls(&payload[..separator], image_id) {
             return None;
         }
         self.expected = None;
+        if self.query_fence {
+            // If the host also acknowledges the transmit, its fence reply follows.
+            self.duplicate = Some((image_id, std::time::Instant::now() + LATE_RESPONSE_DRAIN));
+        }
         self.refresh_active();
         Some(Some(Response {
             transfer_id,
@@ -184,6 +218,32 @@ impl InputFilter {
             }
         }
         (output, responses)
+    }
+}
+
+/// Encodes a validated `t=f` upload. With a query fence, the same file is then
+/// queried: WezTerm answers `a=q` but never acknowledges an `a=t` addressed by
+/// `i=` without `I=`. Its `OK` follows the transmit, so it completes the
+/// transfer and shows the file loaded.
+pub(super) fn encode_upload(
+    out: &mut Vec<u8>,
+    leading: &[u8],
+    control: &str,
+    path: &str,
+    query_fence: bool,
+) {
+    crate::kitty_graphics::encode_kitty_regular_file(out, leading, control, path);
+    if query_fence {
+        let fields = control
+            .split(',')
+            .filter(|field| {
+                ["f=", "s=", "v=", "i="]
+                    .iter()
+                    .any(|key| field.starts_with(key))
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        crate::kitty_graphics::encode_kitty_regular_file(out, &[], &format!("a=q,{fields}"), path);
     }
 }
 
@@ -412,6 +472,69 @@ mod tests {
             .push(b"\x1b_Gi=50;EINVAL\x1b\\", &mut matcher)
             .0
             .is_empty());
+    }
+
+    #[test]
+    fn fenced_upload_queries_the_same_file_after_the_transmit() {
+        let control = "a=t,f=32,s=10,v=20,i=42,q=0";
+        let mut plain = Vec::new();
+        encode_upload(&mut plain, b"", control, "/private/frame", false);
+        let mut fenced = Vec::new();
+        encode_upload(&mut fenced, b"", control, "/private/frame", true);
+        assert!(fenced.starts_with(&plain));
+        let path = "L3ByaXZhdGUvZnJhbWU=";
+        let fence = format!("\x1b_Ga=q,f=32,s=10,v=20,i=42,t=f;{path}\x1b\\");
+        assert!(std::str::from_utf8(&fenced[plain.len()..])
+            .unwrap()
+            .contains(&fence));
+        // Placement keys and quietness are not part of the fence.
+        let mut displayed = Vec::new();
+        encode_upload(
+            &mut displayed,
+            b"",
+            "a=T,f=32,s=10,v=20,i=42,p=7,c=5,r=6,z=-1,C=1,q=0",
+            "/private/frame",
+            true,
+        );
+        assert!(std::str::from_utf8(&displayed).unwrap().contains(&fence));
+    }
+
+    #[test]
+    fn fenced_transfer_drains_a_second_reply_but_never_the_next_transfer() {
+        let mut matcher = ResponseMatcher::with_query_fence(true);
+        let mut filter = InputFilter::default();
+        assert!(matcher.arm(30, 60));
+        let (output, responses) = filter.push(b"\x1b_Gi=60;OK\x1b\\", &mut matcher);
+        assert!(output.is_empty());
+        assert!(responses[0].success);
+        // A host that also acknowledged the transmit answers twice.
+        let (output, responses) = filter.push(b"\x1b_Gi=60;OK\x1b\\", &mut matcher);
+        assert!(output.is_empty() && responses.is_empty());
+        assert!(!matcher.interested());
+
+        assert!(matcher.arm(31, 61));
+        assert_eq!(
+            matcher
+                .consume(b"\x1b_Gi=61;OK\x1b\\")
+                .unwrap()
+                .unwrap()
+                .transfer_id,
+            31
+        );
+        assert!(matcher.arm(32, 61)); // Same image again before the drain expired.
+        assert_eq!(
+            matcher
+                .consume(b"\x1b_Gi=61;OK\x1b\\")
+                .unwrap()
+                .unwrap()
+                .transfer_id,
+            32
+        );
+
+        let mut unfenced = ResponseMatcher::default();
+        assert!(unfenced.arm(33, 62));
+        assert!(unfenced.consume(b"\x1b_Gi=62;OK\x1b\\").is_some());
+        assert_eq!(unfenced.consume(b"\x1b_Gi=62;OK\x1b\\"), None);
     }
 
     #[test]

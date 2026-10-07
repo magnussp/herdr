@@ -69,6 +69,21 @@ pub(super) fn direct_graphics_profile_values(
     supported && !blocked_transport && terminals
 }
 
+/// WezTerm answers `a=q` queries but never acknowledges an `a=t` transmit
+/// addressed by `i=` without `I=` (wezterm term/src/terminalstate/kitty.rs).
+#[cfg(any(unix, test))]
+pub(super) fn direct_graphics_query_fence_values(term_program: &str, term: &str) -> bool {
+    term_program.eq_ignore_ascii_case("wezterm") || term == "xterm-wezterm"
+}
+
+#[cfg(unix)]
+pub(super) fn direct_graphics_query_fence() -> bool {
+    direct_graphics_query_fence_values(
+        &std::env::var("TERM_PROGRAM").unwrap_or_default(),
+        &std::env::var("TERM").unwrap_or_default(),
+    )
+}
+
 /// Server-owned files require a shared filesystem; the host terminal profile alone
 /// cannot establish that for a saved SSH endpoint.
 fn direct_graphics_capability(
@@ -316,6 +331,18 @@ pub(super) fn do_handshake(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_wezterm_uploads_need_a_query_fence() {
+        assert!(direct_graphics_query_fence_values(
+            "WezTerm",
+            "xterm-256color"
+        ));
+        assert!(direct_graphics_query_fence_values("", "xterm-wezterm"));
+        for (term_program, term) in [("ghostty", "xterm-ghostty"), ("", "xterm-kitty"), ("", "")] {
+            assert!(!direct_graphics_query_fence_values(term_program, term));
+        }
+    }
 
     #[test]
     fn direct_graphics_requires_local_transport_even_on_supported_host_terminal() {
