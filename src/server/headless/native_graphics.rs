@@ -303,7 +303,7 @@ impl HeadlessServer {
         if self.native_graphics.can_hold(client, scene) {
             return false;
         }
-        self.retire_native_graphics_for_client(client);
+        self.supersede_native_transfer(client);
         self.app.render_dirty.request_generic();
         if let Some(client) = self.clients.get_mut(&client) {
             client.defer_full_render();
@@ -426,6 +426,12 @@ impl HeadlessServer {
             }
             return Some(refresh);
         }
+        tracing::info!(
+            client,
+            transfer,
+            image,
+            "host terminal rejected a native graphics file; using inline images"
+        );
         self.native_graphics.disabled.insert(client);
         self.native_graphics
             .pending
@@ -454,7 +460,14 @@ impl HeadlessServer {
             false
         });
         for (id, transfer_id, image_id) in expired {
-            self.native_graphics.disabled.insert(id);
+            if self.native_graphics.disabled.insert(id) {
+                tracing::info!(
+                    client = id,
+                    transfer_id,
+                    image_id,
+                    "host terminal did not acknowledge a native graphics file; using inline images"
+                );
+            }
             let message = ServerMessage::GraphicsTransmissionRetired {
                 transfer_id,
                 image_id,
@@ -475,14 +488,32 @@ impl HeadlessServer {
         }
         changed
     }
-    pub(super) fn retire_native_graphics_for_client(&mut self, id: u64) {
-        if let Some(p) = self.native_graphics.pending.get_mut(&id) {
-            p.deadline = Instant::now();
-            self.native_graphics.disabled.insert(id);
-            if self.expire_native_graphics(Instant::now()) {
-                self.app.render_dirty.request_generic();
-            }
+    /// Retires only the pending transfer when the scene it was held for is gone,
+    /// for example after a layout, image source or surface interest change. The
+    /// host did not fail, so later scenes may use native files again.
+    pub(super) fn supersede_native_transfer(&mut self, id: u64) {
+        let Some((transfer_id, image_id)) = self
+            .native_graphics
+            .pending
+            .get(&id)
+            .map(|p| (p.transfer_id, p.image_id))
+        else {
+            return;
+        };
+        let message = ServerMessage::GraphicsTransmissionRetired {
+            transfer_id,
+            image_id,
+        };
+        // Keep the export alive until retirement is queued or disconnect cleans it.
+        if !self.send_to_client(id, message) {
+            return;
         }
+        self.native_graphics.pending.remove(&id);
+        if let Some(c) = self.clients.get_mut(&id) {
+            c.shell_graphics_delivery = DeliveryCache::default();
+            c.defer_full_render();
+        }
+        self.app.render_dirty.request_generic();
     }
     pub(super) fn disconnect_native_graphics(&mut self, id: u64) {
         self.native_graphics.pending.remove(&id);

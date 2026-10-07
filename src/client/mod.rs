@@ -457,7 +457,7 @@ async fn run_client_loop(
         #[cfg(unix)]
         retired_direct_graphics: HashMap::new(),
         #[cfg(unix)]
-        disabled_native_graphics: Default::default(),
+        native_transfers_seen: Default::default(),
         pending_native_cleanup: Vec::new(),
         #[cfg(unix)]
         pending_surface_graphics: HashMap::new(),
@@ -1609,6 +1609,11 @@ async fn run_client_loop(
                         }
                         #[cfg(unix)]
                         {
+                            state.record_native_transfer_seen(
+                                &endpoint_id,
+                                generation,
+                                transfer_id,
+                            );
                             let retirement = state.match_retired_direct_graphics(
                                 &endpoint_id,
                                 generation,
@@ -1634,8 +1639,6 @@ async fn run_client_loop(
                             let native_valid = !native
                                 || surface_asset.as_ref().is_some_and(|asset| {
                                     !state.presentation_frozen
-                                        && state.disabled_native_graphics.get(&endpoint_id)
-                                            != Some(&generation)
                                         && graphics_owner_is_active(
                                             &state,
                                             &write_stream,
