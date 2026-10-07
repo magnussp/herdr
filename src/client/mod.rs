@@ -453,7 +453,11 @@ async fn run_client_loop(
         pixel_geometry_exact: initial_pixel_geometry_exact,
         host_sgr_pixel_mouse: config.host_sgr_pixel_mouse,
         #[cfg(unix)]
-        direct_graphics_response: Arc::new(Mutex::new(direct_graphics::ResponseMatcher::default())),
+        direct_graphics_response: Arc::new(Mutex::new(
+            direct_graphics::ResponseMatcher::with_query_fence(
+                handshake::direct_graphics_query_fence(),
+            ),
+        )),
         #[cfg(unix)]
         retired_direct_graphics: HashMap::new(),
         #[cfg(unix)]
@@ -1666,12 +1670,17 @@ async fn run_client_loop(
                                     .lock()
                                     .is_ok_and(|mut matcher| matcher.arm(transfer_id, image_id));
                             let sent = if valid {
+                                let query_fence = state
+                                    .direct_graphics_response
+                                    .lock()
+                                    .is_ok_and(|matcher| matcher.query_fence());
                                 let mut command = Vec::new();
-                                crate::kitty_graphics::encode_kitty_regular_file(
+                                direct_graphics::encode_upload(
                                     &mut command,
                                     &leading,
                                     &control,
                                     &path,
+                                    query_fence,
                                 );
                                 let mut stdout = io::stdout();
                                 let written = state
