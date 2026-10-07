@@ -167,6 +167,41 @@ mod local_files {
         }
     }
     #[test]
+    fn every_candidate_root_is_queried_in_order_and_the_consumed_one_is_used() {
+        let scratch = Scratch::new();
+        let roots = ["preferred", "fallback"].map(|name| {
+            let root = scratch.0.join(name);
+            std::fs::create_dir(&root).unwrap();
+            root
+        });
+        let mut files = FileTransport::for_test_roots(roots.to_vec());
+        let mut first = Vec::new();
+        write_composed_frame(&mut first, b"text", &output(32), &mut files).unwrap();
+        let text = std::str::from_utf8(&first).unwrap();
+        let queries = text
+            .split("\x1b_G")
+            .filter(|command| command.starts_with("a=q,"))
+            .map(|command| command_path(format!("\x1b_G{command}").as_bytes(), "a=q,"))
+            .collect::<Vec<_>>();
+        assert_eq!(queries.len(), 2);
+        assert!(queries[0].starts_with(&roots[0]));
+        assert!(queries[1].starts_with(&roots[1]));
+        assert!(text.find("a=q,").unwrap() < text.find("a=t,t=d").unwrap());
+        // Ghostty 1.3 on macOS refuses /tmp but consumes its $TMPDIR file.
+        std::fs::remove_file(&queries[1]).unwrap();
+        let mut ready = Vec::new();
+        write_composed_frame(&mut ready, b"text", &output(32), &mut files).unwrap();
+        assert!(!std::str::from_utf8(&ready).unwrap().contains("a=q,"));
+        let image = command_path(&ready, "a=t,");
+        assert!(image.starts_with(&roots[1]));
+        assert_eq!(std::fs::read(&image).unwrap(), [1, 2, 3, 4]);
+        assert!(queries[0].exists());
+        drop(files);
+        assert!(!queries[0].exists());
+        assert!(!image.exists());
+    }
+
+    #[test]
     fn unsupported_format_and_file_creation_failure_remain_inline() {
         let root = Scratch::new();
         let mut files = FileTransport::for_test(root.0.clone());

@@ -1,5 +1,6 @@
 //! Unix-owned Kitty temporary-file ledger and bounded crash recovery.
 
+use std::ffi::OsString;
 use std::fs::{self, DirBuilder, OpenOptions};
 use std::io::{self, Read, Write};
 use std::os::fd::AsRawFd;
@@ -16,6 +17,7 @@ const MAX_GENERATIONS: usize = 8;
 const STALE_GRACE: Duration = Duration::from_secs(60);
 const GENERATION_PREFIX: &str = "herdr-tty-graphics-protocol-";
 const CONSUMPTION_TIMEOUT: Duration = Duration::from_secs(10);
+const PROBE_PIXEL: [u8; 4] = [0, 0, 0, 0];
 
 struct Pending {
     path: PathBuf,
@@ -23,16 +25,35 @@ struct Pending {
     published: Instant,
 }
 
+/// A candidate root and this client's private generation inside it, if any.
+struct Candidate {
+    root: PathBuf,
+    directory: Option<Generation>,
+}
+
+struct Probe {
+    candidate: usize,
+    path: PathBuf,
+}
+
 enum ProbeState {
     Unsent,
-    Pending(PathBuf),
+    Pending {
+        probes: Vec<Probe>,
+        published: Instant,
+    },
     Consumed,
 }
 
 pub(crate) struct Ledger {
-    root: PathBuf,
-    directory: Option<Generation>,
+    /// Preference order. Only the root whose query file the terminal consumed
+    /// first ever receives real uploads.
+    candidates: Vec<Candidate>,
+    selected: usize,
     pending: Vec<Pending>,
+    /// Published query files the terminal did not consume first. They may still
+    /// be opened, so they are only removed at shutdown, like pending uploads.
+    abandoned: Vec<PathBuf>,
     next: u64,
     disabled: bool,
     probe: ProbeState,
@@ -40,35 +61,67 @@ pub(crate) struct Ledger {
 
 impl Ledger {
     #[cfg(test)]
-    pub(crate) fn for_test(root: PathBuf) -> Self {
-        let mut ledger = Self::new();
-        ledger.root = root;
-        ledger
+    pub(crate) fn for_test(roots: Vec<PathBuf>) -> Self {
+        Self::with_roots(roots)
     }
 
     pub(crate) fn new() -> Self {
+        Self::with_roots(candidate_roots(
+            std::env::var_os("TMPDIR"),
+            Path::new("/tmp"),
+        ))
+    }
+
+    fn with_roots(roots: Vec<PathBuf>) -> Self {
         Self {
-            // Do not use TMPDIR/XDG_RUNTIME_DIR: a client override need not
-            // be in the terminal's accepted temporary-file roots. /tmp is
-            // explicitly accepted by Ghostty graphics_image.zig in v1.1.3,
-            // v1.2.3 and main, independent of its TMPDIR. /var/tmp is NOT
-            // generally accepted, so this bounded ledger must use /tmp.
-            root: PathBuf::from("/tmp"),
-            directory: None,
+            candidates: roots
+                .into_iter()
+                .map(|root| Candidate {
+                    root,
+                    directory: None,
+                })
+                .collect(),
+            selected: 0,
             pending: Vec::new(),
+            abandoned: Vec::new(),
             next: 0,
             disabled: false,
             probe: ProbeState::Unsent,
         }
     }
 
-    pub(crate) fn probe(&mut self) -> Option<PathBuf> {
+    /// Once per client, publish one 1x1 query file in every usable candidate
+    /// root, in preference order. The caller must emit every returned path.
+    pub(crate) fn probe(&mut self) -> Vec<PathBuf> {
+        self.probe_at(Instant::now())
+    }
+
+    fn probe_at(&mut self, now: Instant) -> Vec<PathBuf> {
         if self.disabled || !matches!(self.probe, ProbeState::Unsent) {
-            return None;
+            return Vec::new();
         }
-        let path = self.prepare_file_at(&[0, 0, 0, 0], Instant::now())?;
-        self.probe = ProbeState::Pending(path.clone());
-        Some(path)
+        let mut probes = Vec::new();
+        for candidate in 0..self.candidates.len() {
+            match self.write_file(candidate, &PROBE_PIXEL) {
+                Ok(path) => probes.push(Probe { candidate, path }),
+                Err(error) => tracing::debug!(
+                    %error,
+                    root = %self.candidates[candidate].root.display(),
+                    "kitty temporary-file root unavailable"
+                ),
+            }
+        }
+        if probes.is_empty() {
+            tracing::info!("kitty temporary-file transport unavailable: no usable root");
+            self.disabled = true;
+            return Vec::new();
+        }
+        let paths = probes.iter().map(|probe| probe.path.clone()).collect();
+        self.probe = ProbeState::Pending {
+            probes,
+            published: now,
+        };
+        paths
     }
 
     pub(crate) fn prepare(&mut self, data: &[u8]) -> Option<PathBuf> {
@@ -93,7 +146,7 @@ impl Ledger {
         {
             return None;
         }
-        match self.write_file(data) {
+        match self.write_file(self.selected, data) {
             Ok(path) => {
                 self.pending.push(Pending {
                     path: path.clone(),
@@ -111,19 +164,35 @@ impl Ledger {
     }
 
     fn reap(&mut self, now: Instant) {
-        if let ProbeState::Pending(path) = &self.probe {
-            if matches!(fs::symlink_metadata(path), Err(error) if error.kind() == io::ErrorKind::NotFound)
-            {
-                // With the allowlisted raw query this demonstrates local medium
-                // consumption, not arbitrary image acceptance or presentation.
+        if let ProbeState::Pending { probes, published } = &mut self.probe {
+            // Preference order decides when several roots were consumed. With
+            // the allowlisted raw query this demonstrates local medium
+            // consumption, not arbitrary image acceptance or presentation.
+            if let Some(index) = probes.iter().position(|probe| is_consumed(&probe.path)) {
+                let winner = probes.remove(index);
+                self.abandoned
+                    .extend(probes.drain(..).map(|probe| probe.path));
+                self.selected = winner.candidate;
                 self.probe = ProbeState::Consumed;
+                tracing::info!(
+                    root = %self.candidates[winner.candidate].root.display(),
+                    "kitty temporary-file transport enabled"
+                );
+            } else if now.saturating_duration_since(*published) >= CONSUMPTION_TIMEOUT {
+                let roots = probes
+                    .iter()
+                    .map(|probe| self.candidates[probe.candidate].root.display().to_string())
+                    .collect::<Vec<_>>();
+                tracing::warn!(
+                    ?roots,
+                    "terminal did not consume a kitty temporary-file query; using inline images"
+                );
+                self.abandoned
+                    .extend(probes.drain(..).map(|probe| probe.path));
+                self.disabled = true;
             }
         }
-        self.pending
-            .retain(|entry| match fs::symlink_metadata(&entry.path) {
-                Err(error) if error.kind() == io::ErrorKind::NotFound => false,
-                _ => true, // Permission/I/O errors are NOT evidence of consumption.
-            });
+        self.pending.retain(|entry| !is_consumed(&entry.path));
         if self
             .pending
             .iter()
@@ -133,16 +202,20 @@ impl Ledger {
         }
     }
 
-    fn write_file(&mut self, data: &[u8]) -> io::Result<PathBuf> {
-        if self.directory.is_none() {
-            self.directory = Some(create_generation(&self.root, SystemTime::now())?);
+    fn write_file(&mut self, candidate: usize, data: &[u8]) -> io::Result<PathBuf> {
+        let candidate = self
+            .candidates
+            .get_mut(candidate)
+            .ok_or_else(|| io::Error::other("missing temporary-file root"))?;
+        if candidate.directory.is_none() {
+            candidate.directory = Some(create_generation(&candidate.root, SystemTime::now())?);
         }
         let number = self.next;
         self.next = self
             .next
             .checked_add(1)
             .ok_or_else(|| io::Error::other("file sequence exhausted"))?;
-        let path = self
+        let path = candidate
             .directory
             .as_ref()
             .ok_or_else(|| io::Error::other("missing file generation"))?
@@ -176,14 +249,55 @@ impl Ledger {
 
     pub(crate) fn cleanup(&mut self) {
         self.disabled = true;
+        if let ProbeState::Pending { probes, .. } = &mut self.probe {
+            self.abandoned
+                .extend(probes.drain(..).map(|probe| probe.path));
+        }
         for entry in self.pending.drain(..) {
             let _ = fs::remove_file(entry.path);
         }
-        if let Some(directory) = self.directory.take() {
-            // Never recursively delete: remove only paths we created.
-            let _ = fs::remove_dir(&directory.path);
+        for path in self.abandoned.drain(..) {
+            let _ = fs::remove_file(path);
+        }
+        for candidate in &mut self.candidates {
+            if let Some(directory) = candidate.directory.take() {
+                // Never recursively delete: remove only paths we created.
+                let _ = fs::remove_dir(&directory.path);
+            }
         }
     }
+}
+
+/// Only a confirmed absence is consumption. Permission/I/O errors are NOT evidence.
+fn is_consumed(path: &Path) -> bool {
+    matches!(fs::symlink_metadata(path), Err(error) if error.kind() == io::ErrorKind::NotFound)
+}
+
+/// Terminals accept `t=t` files only under their own temporary roots, after
+/// canonicalizing the path. Ghostty 1.3 on macOS refuses `/tmp` (a symlink to
+/// `/private/tmp`) but accepts its `$TMPDIR`, which a local client normally
+/// inherits. Neither is trusted: every root is probed and only a consumed one
+/// is used. `$TMPDIR` comes first because it is per-user on macOS.
+fn candidate_roots(tmpdir: Option<OsString>, fixed: &Path) -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    if let Some(tmpdir) = tmpdir
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute() && path.to_str().is_some())
+    {
+        roots.push(tmpdir);
+    }
+    if !roots.iter().any(|root| same_directory(root, fixed)) {
+        roots.push(fixed.to_owned());
+    }
+    roots
+}
+
+fn same_directory(left: &Path, right: &Path) -> bool {
+    left == right
+        || matches!(
+            (fs::canonicalize(left), fs::canonicalize(right)),
+            (Ok(left), Ok(right)) if left == right
+        )
 }
 
 impl Drop for Ledger {
@@ -386,11 +500,24 @@ mod tests {
 
     fn test_ledger() -> TestLedger {
         let scratch = private_directory(Path::new("/var/tmp")).unwrap();
-        let mut ledger = Ledger::new();
-        ledger.root = scratch.clone();
+        let mut ledger = Ledger::for_test(vec![scratch.clone()]);
         // Most ledger tests start after successful query consumption.
         ledger.probe = ProbeState::Consumed;
         TestLedger { ledger, scratch }
+    }
+
+    /// Unprobed ledger over `count` distinct candidate roots in one scratch tree.
+    fn multi_root_ledger(count: usize) -> (TestLedger, Vec<PathBuf>) {
+        let scratch = private_directory(Path::new("/var/tmp")).unwrap();
+        let roots = (0..count)
+            .map(|index| {
+                let root = scratch.join(format!("root-{index}"));
+                fs::create_dir(&root).unwrap();
+                root
+            })
+            .collect::<Vec<_>>();
+        let ledger = Ledger::for_test(roots.clone());
+        (TestLedger { ledger, scratch }, roots)
     }
 
     #[test]
@@ -445,7 +572,7 @@ mod tests {
         assert!(ledger.prepare(&[]).is_none());
         let mut data = vec![0; MAX_IMAGE_BYTES + 1];
         assert!(ledger.prepare(&data).is_none());
-        assert!(ledger.directory.is_none());
+        assert!(ledger.candidates[0].directory.is_none());
         data.pop();
         for _ in 0..MAX_BYTES / MAX_IMAGE_BYTES {
             assert!(ledger.prepare(&data).is_some());
@@ -478,7 +605,7 @@ mod tests {
         assert!(ledger.prepare(b"must not overwrite").is_none());
         assert_eq!(fs::read(path).unwrap(), b"published");
         let mut broken = test_ledger();
-        broken.root = ledger.pending[0].path.clone(); // Not a directory.
+        broken.candidates[0].root = ledger.pending[0].path.clone(); // Not a directory.
         assert!(broken.prepare(b"inline").is_none());
         assert!(broken.disabled);
     }
@@ -488,30 +615,129 @@ mod tests {
         let mut ledger = test_ledger();
         ledger.probe = ProbeState::Unsent;
         assert!(ledger.prepare(b"real").is_none());
-        assert!(ledger.directory.is_none());
-        let query = ledger.probe().unwrap();
-        assert_eq!(fs::read(&query).unwrap(), [0, 0, 0, 0]);
-        assert_eq!(ledger.pending.len(), 1);
-        assert_eq!(ledger.pending[0].bytes, 4);
-        assert!(ledger.probe().is_none());
+        assert!(ledger.candidates[0].directory.is_none());
+        let [query] = <[PathBuf; 1]>::try_from(ledger.probe()).unwrap();
+        assert_eq!(fs::read(&query).unwrap(), PROBE_PIXEL);
+        assert!(ledger.pending.is_empty()); // Queries take no upload slot.
+        assert!(ledger.probe().is_empty());
         assert!(ledger.prepare(b"real").is_none());
         fs::remove_file(query).unwrap();
         assert!(ledger.prepare(b"real").is_some());
-        assert!(ledger.probe().is_none());
+        assert!(ledger.probe().is_empty());
     }
 
     #[test]
     fn probe_timeout_preserves_file_and_permanently_disables_conversion() {
         let mut ledger = test_ledger();
         ledger.probe = ProbeState::Unsent;
-        let query = ledger.probe().unwrap();
-        let late = ledger.pending[0].published + CONSUMPTION_TIMEOUT;
+        let start = Instant::now();
+        let [query] = <[PathBuf; 1]>::try_from(ledger.probe_at(start)).unwrap();
+        let late = start + CONSUMPTION_TIMEOUT;
         assert!(ledger.prepare_at(b"real", late).is_none());
         assert!(ledger.disabled);
-        assert_eq!(fs::read(&query).unwrap(), [0, 0, 0, 0]);
+        assert_eq!(fs::read(&query).unwrap(), PROBE_PIXEL);
         fs::remove_file(query).unwrap();
         assert!(ledger.prepare_at(b"real", late).is_none());
-        assert!(ledger.probe().is_none());
+        assert!(ledger.probe().is_empty());
+    }
+
+    #[test]
+    fn first_consumed_root_is_used_and_refused_queries_wait_for_shutdown() {
+        let (mut ledger, roots) = multi_root_ledger(2);
+        let start = Instant::now();
+        let queries = ledger.probe_at(start);
+        assert_eq!(queries.len(), 2);
+        for (query, root) in queries.iter().zip(&roots) {
+            assert!(query.starts_with(root));
+            assert_eq!(fs::read(query).unwrap(), PROBE_PIXEL);
+        }
+        assert!(ledger.probe_at(start).is_empty());
+        // The terminal refuses the preferred root and consumes the second.
+        fs::remove_file(&queries[1]).unwrap();
+        let image = ledger.prepare_at(b"real", start).unwrap();
+        assert!(image.starts_with(&roots[1]));
+        fs::remove_file(&image).unwrap();
+        // A refused query is neither a pending upload nor a reason to disable.
+        let late = start + CONSUMPTION_TIMEOUT;
+        assert!(ledger
+            .prepare_at(b"later", late)
+            .unwrap()
+            .starts_with(&roots[1]));
+        assert!(!ledger.disabled);
+        assert_eq!(fs::read(&queries[0]).unwrap(), PROBE_PIXEL);
+        let generations = queries
+            .iter()
+            .map(|query| query.parent().unwrap().to_owned())
+            .collect::<Vec<_>>();
+        ledger.cleanup();
+        assert!(!queries[0].exists());
+        assert!(generations.iter().all(|generation| !generation.exists()));
+    }
+
+    #[test]
+    fn preference_order_breaks_ties_between_consumed_roots() {
+        let (mut ledger, roots) = multi_root_ledger(2);
+        let queries = ledger.probe();
+        for query in &queries {
+            fs::remove_file(query).unwrap();
+        }
+        assert!(ledger.prepare(b"real").unwrap().starts_with(&roots[0]));
+    }
+
+    #[test]
+    fn unusable_roots_are_skipped_and_none_left_disables() {
+        let (mut ledger, roots) = multi_root_ledger(2);
+        let file = roots[0].join("not-a-directory");
+        fs::write(&file, b"x").unwrap();
+        ledger.candidates[0].root = file;
+        let [query] = <[PathBuf; 1]>::try_from(ledger.probe()).unwrap();
+        assert!(query.starts_with(&roots[1]));
+        assert!(!ledger.disabled);
+
+        let (mut none, roots) = multi_root_ledger(1);
+        none.candidates[0].root = roots[0].join("absent");
+        assert!(none.probe().is_empty());
+        assert!(none.disabled);
+        assert!(none.prepare(b"inline").is_none());
+    }
+
+    #[test]
+    fn no_consumed_root_times_out_and_keeps_every_query() {
+        let (mut ledger, _roots) = multi_root_ledger(2);
+        let start = Instant::now();
+        let queries = ledger.probe_at(start);
+        assert!(ledger
+            .prepare_at(b"real", start + CONSUMPTION_TIMEOUT)
+            .is_none());
+        assert!(ledger.disabled);
+        assert!(queries.iter().all(|query| query.exists()));
+        ledger.cleanup();
+        assert!(queries.iter().all(|query| !query.exists()));
+    }
+
+    #[test]
+    fn candidate_roots_prefer_absolute_tmpdir_then_fixed_root_once() {
+        use std::os::unix::fs::symlink;
+        let fixture = test_ledger();
+        let fixed = fixture.scratch.join("fixed");
+        let other = fixture.scratch.join("other");
+        let alias = fixture.scratch.join("alias");
+        fs::create_dir(&fixed).unwrap();
+        fs::create_dir(&other).unwrap();
+        symlink(&fixed, &alias).unwrap();
+        let roots = |tmpdir: Option<&Path>| {
+            candidate_roots(tmpdir.map(|path| path.as_os_str().to_owned()), &fixed)
+        };
+        assert_eq!(roots(None), vec![fixed.clone()]);
+        assert_eq!(roots(Some(Path::new(""))), vec![fixed.clone()]);
+        assert_eq!(roots(Some(Path::new("relative/tmp"))), vec![fixed.clone()]);
+        assert_eq!(roots(Some(&other)), vec![other.clone(), fixed.clone()]);
+        // Same directory spelled differently, e.g. /private/tmp on macOS.
+        assert_eq!(roots(Some(&alias)), vec![alias.clone()]);
+        assert_eq!(roots(Some(&fixed.join(""))), vec![fixed.join("")]);
+        // A missing TMPDIR stays a candidate; probing skips it.
+        let missing = fixture.scratch.join("missing");
+        assert_eq!(roots(Some(&missing)), vec![missing, fixed.clone()]);
     }
 
     fn recover_for_test(parent: &Path, now: SystemTime) -> usize {
@@ -529,7 +755,7 @@ mod tests {
         let later = SystemTime::now() + STALE_GRACE + Duration::from_secs(1);
         assert_eq!(recover_for_test(parent, later), 1);
         assert!(image.exists()); // Advisory lock protects live clients even if old.
-        let generation = ledger.directory.take().unwrap();
+        let generation = ledger.candidates[0].directory.take().unwrap();
         ledger.pending.clear(); // Simulate process death without Drop cleanup.
         drop(generation);
         assert_eq!(recover_for_test(parent, SystemTime::now()), 1);
@@ -573,7 +799,7 @@ mod tests {
         fs::write(&outside, b"outside").unwrap();
         symlink(&outside, &image).unwrap();
         ledger.pending.clear();
-        drop(ledger.directory.take());
+        drop(ledger.candidates[0].directory.take());
         let later = SystemTime::now() + STALE_GRACE + Duration::from_secs(1);
         assert_eq!(recover_for_test(parent, later), 1);
         assert_eq!(fs::read(&outside).unwrap(), b"outside");
