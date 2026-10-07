@@ -446,6 +446,34 @@ fn native_timeout_uses_control_lane_and_falls_back_inline() {
 }
 
 #[test]
+fn superseded_transfer_retires_only_itself_and_native_stays_enabled() {
+    let mut server = test_headless_server();
+    let (control, _render) = add_client(&mut server, 7);
+    let (path, token, image) = prepare_and_commit(&mut server, 7);
+    native_started(&mut server, 7, token, image);
+    // Another pane's image replaces the held one before the host answers.
+    let mut changed = scene();
+    changed.placements[0].asset.source = SurfaceGraphicsSource::Terminal {
+        target: SurfaceGraphicsTarget::Pane {
+            pane_id: "another-pane".into(),
+        },
+        image_id: 1,
+    };
+    assert!(server.defer_changed_native_geometry(7, &changed));
+    assert_retirement(&control, token, image);
+    assert!(!path.exists());
+    assert!(!server.native_graphics.is_pending(7));
+    assert_eq!(server.clients[&7].deferred_render(), DeferredRender::Full);
+    assert!(!native_result(&mut server, 7, token, image, true));
+
+    let (next_path, next_token, next_image) = prepare_and_commit(&mut server, 7);
+    assert_ne!(next_token, token);
+    assert_eq!(next_image, image); // The retired bank was never acknowledged.
+    ack_native(&mut server, 7, next_token, next_image);
+    assert!(!next_path.exists());
+}
+
+#[test]
 fn native_rejection_falls_back_without_disabling_other_client() {
     let mut server = test_headless_server();
     let (control, render) = add_client(&mut server, 7);
@@ -810,7 +838,7 @@ async fn oversized_inline_trims_largest_and_sends_fitting_asset_without_retry_sp
 }
 
 #[tokio::test]
-async fn quiet_native_producer_geometry_retirement_schedules_full_inline_recovery() {
+async fn quiet_native_producer_geometry_retirement_schedules_full_native_recovery() {
     for retained in [false, true] {
         let (mut server, _control, _render, pane) = retained_test_server_with_control(
             b"\x1b_Ga=T,f=32,t=d,i=7,p=3,s=1,v=1,c=1,r=1,q=2;/wAA/w==\x1b\\",
@@ -907,24 +935,36 @@ async fn quiet_native_producer_geometry_retirement_schedules_full_inline_recover
         );
         server.render_and_stream();
         let recovered = drain_native_render_messages(&writer);
-        assert!(!recovered
-            .iter()
-            .any(|message| matches!(message, ServerMessage::GraphicsFile { .. })));
         let surface = recovered
             .iter()
             .find_map(|message| match message {
                 ServerMessage::PaneSurface(surface) => Some(surface),
                 _ => None,
             })
-            .expect(
-                "next scheduled full render delivers inline fallback without new producer activity",
-            );
+            .expect("next scheduled full render recovers without new producer activity");
         assert_eq!(surface.graphics.placements.len(), 1);
         assert_eq!(surface.graphics.placements[0].cols, 2);
-        assert_eq!(surface.graphics.assets.len(), 1);
-        assert_eq!(surface.graphics.assets[0].data, [255, 0, 0, 255]);
+        // Only the superseded transfer was retired: the new geometry is uploaded
+        // natively again, into the bank that was never acknowledged.
+        assert!(surface.graphics.assets.is_empty());
+        let next = recovered
+            .iter()
+            .find_map(|message| match message {
+                ServerMessage::GraphicsFile {
+                    transfer_id,
+                    image_id,
+                    ..
+                } => Some((*transfer_id, *image_id)),
+                _ => None,
+            })
+            .expect("native upload after a superseded transfer");
+        assert_ne!(next.0, token);
+        assert_eq!(next.1, image);
+        assert!(server.native_graphics.is_pending(1), "retained={retained}");
         assert!(server.clients[&1].direct_graphics);
-        assert_eq!(server.clients[&1].deferred_render(), DeferredRender::None);
+        native_started(&mut server, 1, next.0, next.1);
+        native_result(&mut server, 1, next.0, next.1, true);
+        assert!(!server.native_graphics.is_pending(1));
         shutdown_test_runtimes(&mut server);
     }
 }

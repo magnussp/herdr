@@ -57,8 +57,9 @@ pub(super) struct ClientState {
     pub(super) direct_graphics_response: Arc<Mutex<direct_graphics::ResponseMatcher>>,
     #[cfg(unix)]
     pub(super) retired_direct_graphics: HashMap<endpoint::ClientEndpointId, RetiredDirectGraphics>,
+    /// Connection generation and highest native transfer whose file was handled.
     #[cfg(unix)]
-    pub(super) disabled_native_graphics: HashMap<endpoint::ClientEndpointId, u64>,
+    pub(super) native_transfers_seen: HashMap<endpoint::ClientEndpointId, (u64, u64)>,
     pub(super) pending_native_cleanup: Vec<u8>,
     #[cfg(unix)]
     pub(super) pending_surface_graphics: HashMap<
@@ -122,7 +123,7 @@ impl ClientState {
             #[cfg(unix)]
             retired_direct_graphics: HashMap::new(),
             #[cfg(unix)]
-            disabled_native_graphics: Default::default(),
+            native_transfers_seen: Default::default(),
             pending_native_cleanup: Vec::new(),
             #[cfg(unix)]
             pending_surface_graphics: HashMap::new(),
@@ -235,11 +236,17 @@ impl ClientState {
         image_id: u32,
         owner_active: bool,
     ) {
-        if transfer_id & crate::kitty_graphics::surface::NATIVE_TRANSFER_BIT != 0 {
-            self.disabled_native_graphics
-                .insert(endpoint_id.clone(), generation);
+        // A native retirement may only mean the scene changed; the server stops
+        // native uploads itself after host failures. A tombstone is needed only
+        // while the retired file can still arrive.
+        if !self.native_transfer_seen(endpoint_id, generation, transfer_id) {
+            self.record_retired_direct_graphics(
+                endpoint_id.clone(),
+                generation,
+                transfer_id,
+                image_id,
+            );
         }
-        self.record_retired_direct_graphics(endpoint_id.clone(), generation, transfer_id, image_id);
         let upload_pending = self
             .pending_surface_graphics
             .remove(&(endpoint_id.clone(), generation, transfer_id, image_id))
@@ -397,6 +404,43 @@ impl ClientState {
         }
     }
 
+    /// Native transfer IDs only grow for one server connection, and their files
+    /// arrive in order, so one high-water mark identifies every handled file.
+    #[cfg(unix)]
+    pub(super) fn record_native_transfer_seen(
+        &mut self,
+        endpoint_id: &endpoint::ClientEndpointId,
+        generation: u64,
+        transfer_id: u64,
+    ) {
+        if transfer_id & crate::kitty_graphics::surface::NATIVE_TRANSFER_BIT == 0 {
+            return;
+        }
+        let seen = self
+            .native_transfers_seen
+            .entry(endpoint_id.clone())
+            .or_insert((generation, transfer_id));
+        if seen.0 != generation {
+            *seen = (generation, transfer_id);
+        }
+        seen.1 = seen.1.max(transfer_id);
+    }
+
+    #[cfg(unix)]
+    fn native_transfer_seen(
+        &self,
+        endpoint_id: &endpoint::ClientEndpointId,
+        generation: u64,
+        transfer_id: u64,
+    ) -> bool {
+        transfer_id & crate::kitty_graphics::surface::NATIVE_TRANSFER_BIT != 0
+            && self.native_transfers_seen.get(endpoint_id).is_some_and(
+                |(seen_generation, highest)| {
+                    *seen_generation == generation && transfer_id <= *highest
+                },
+            )
+    }
+
     #[cfg(unix)]
     pub(super) fn record_retired_direct_graphics(
         &mut self,
@@ -465,8 +509,12 @@ impl ClientState {
         generation: u64,
     ) {
         self.retire_pending_endpoint_graphics(endpoint_id, Some(generation));
-        if self.disabled_native_graphics.get(endpoint_id) == Some(&generation) {
-            self.disabled_native_graphics.remove(endpoint_id);
+        if self
+            .native_transfers_seen
+            .get(endpoint_id)
+            .is_some_and(|(seen_generation, _)| *seen_generation == generation)
+        {
+            self.native_transfers_seen.remove(endpoint_id);
         }
         if self
             .retired_direct_graphics
@@ -485,8 +533,12 @@ impl ClientState {
         generation: u64,
     ) {
         self.retire_pending_endpoint_graphics(endpoint_id, None);
-        if self.disabled_native_graphics.get(endpoint_id) != Some(&generation) {
-            self.disabled_native_graphics.remove(endpoint_id);
+        if self
+            .native_transfers_seen
+            .get(endpoint_id)
+            .is_some_and(|(seen_generation, _)| *seen_generation != generation)
+        {
+            self.native_transfers_seen.remove(endpoint_id);
         }
         if self
             .retired_direct_graphics
@@ -500,7 +552,7 @@ impl ClientState {
     #[cfg(unix)]
     pub(super) fn forget_endpoint_graphics(&mut self, endpoint_id: &endpoint::ClientEndpointId) {
         self.retire_pending_endpoint_graphics(endpoint_id, None);
-        self.disabled_native_graphics.remove(endpoint_id);
+        self.native_transfers_seen.remove(endpoint_id);
         self.retired_direct_graphics.remove(endpoint_id);
     }
 
@@ -586,7 +638,6 @@ mod native_cleanup_tests {
         let endpoint = endpoint::ClientEndpointId::Local;
         state.record_retired_direct_graphics(endpoint.clone(), 7, 11, 1234);
         state.record_retired_direct_graphics(endpoint.clone(), 7, 12, 5678);
-        state.disabled_native_graphics.insert(endpoint.clone(), 7);
 
         // Switching away and back does not reset guards, and an unrelated queued file cannot
         // consume either of two sequential API retirement tombstones.
@@ -603,7 +654,6 @@ mod native_cleanup_tests {
                 .len(),
             2
         );
-        assert_eq!(state.disabled_native_graphics.get(&endpoint), Some(&7));
         assert_eq!(
             state.match_retired_direct_graphics(&endpoint, 7, 11, 1234),
             RetiredDirectGraphicsMatch::Exact
@@ -627,7 +677,7 @@ mod native_cleanup_tests {
         let endpoint = endpoint::ClientEndpointId::Local;
         let native = crate::kitty_graphics::surface::NATIVE_TRANSFER_BIT | 11;
         state.record_retired_direct_graphics(endpoint.clone(), 7, native, 1234);
-        state.disabled_native_graphics.insert(endpoint.clone(), 7);
+        state.record_native_transfer_seen(&endpoint, 7, native);
 
         state.start_endpoint_graphics_generation(&endpoint, 8);
 
@@ -635,7 +685,42 @@ mod native_cleanup_tests {
             state.match_retired_direct_graphics(&endpoint, 7, native, 1234),
             RetiredDirectGraphicsMatch::None
         );
-        assert!(!state.disabled_native_graphics.contains_key(&endpoint));
+        assert!(!state.native_transfers_seen.contains_key(&endpoint));
+    }
+
+    #[test]
+    fn superseded_native_transfers_keep_native_files_accepted() {
+        let mut state = ClientState::test_new();
+        let endpoint = endpoint::ClientEndpointId::Local;
+        let native = crate::kitty_graphics::surface::NATIVE_TRANSFER_BIT;
+        // Retirements of files already handled, as after each layout change
+        // while an upload is in flight, never saturate the tombstones.
+        for transfer in 1..=(MAX_RETIRED_DIRECT_GRAPHICS as u64 + 1) {
+            state.record_native_transfer_seen(&endpoint, 7, native | transfer);
+            state.receive_graphics_retirement(&endpoint, 7, native | transfer, 1234, true);
+        }
+        assert!(!state.retired_direct_graphics.contains_key(&endpoint));
+        let next = native | (MAX_RETIRED_DIRECT_GRAPHICS as u64 + 2);
+        state.record_native_transfer_seen(&endpoint, 7, next);
+        assert_eq!(
+            state.match_retired_direct_graphics(&endpoint, 7, next, 1234),
+            RetiredDirectGraphicsMatch::None
+        );
+
+        // A retirement that overtakes its file still rejects that exact file.
+        let late = next + 1;
+        state.receive_graphics_retirement(&endpoint, 7, late, 1234, true);
+        state.record_native_transfer_seen(&endpoint, 7, late);
+        assert_eq!(
+            state.match_retired_direct_graphics(&endpoint, 7, late, 1234),
+            RetiredDirectGraphicsMatch::Exact
+        );
+        // Another connection generation has its own transfer numbering.
+        state.receive_graphics_retirement(&endpoint, 8, native | 1, 1234, true);
+        assert_eq!(
+            state.match_retired_direct_graphics(&endpoint, 8, native | 1, 1234),
+            RetiredDirectGraphicsMatch::Exact
+        );
     }
 
     #[test]
