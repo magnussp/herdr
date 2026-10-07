@@ -1388,6 +1388,7 @@ async fn run_client_loop(
                 endpoint_id,
                 generation,
                 message,
+                credit: _credit,
             } => {
                 if !write_stream.accepts(&endpoint_id, generation) {
                     continue;

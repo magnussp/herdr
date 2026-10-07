@@ -18,6 +18,9 @@ pub(super) enum ClientLoopEvent {
         endpoint_id: endpoint::ClientEndpointId,
         generation: u64,
         message: Box<ServerMessage>,
+        /// Keeps the endpoint reader from reading further ahead until this
+        /// message has been handled, including any blocking terminal output.
+        credit: transport::ReadAheadCredit,
     },
     ServerDisconnected {
         endpoint_id: endpoint::ClientEndpointId,
