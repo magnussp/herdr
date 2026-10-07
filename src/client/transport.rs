@@ -31,6 +31,65 @@ pub(super) fn start_endpoint_transport(
     Ok(transport)
 }
 
+/// Wire bytes of decoded server messages that the client loop may leave
+/// unhandled before the reader stops draining the socket. Handling a frame can
+/// block on the host terminal. Reading further ahead would queue superseded
+/// frames here instead of letting the server's latest-wins render slot drop them.
+const READ_AHEAD_BYTES: usize = 1024 * 1024;
+const READ_AHEAD_STOP_POLL: Duration = Duration::from_millis(50);
+
+#[derive(Default)]
+struct ReadAhead {
+    unhandled: std::sync::Mutex<usize>,
+    handled: std::sync::Condvar,
+}
+
+/// Charges a server message's wire bytes to its reader until the client loop
+/// drops the message event.
+pub(super) struct ReadAheadCredit {
+    budget: Arc<ReadAhead>,
+    bytes: usize,
+}
+
+impl Drop for ReadAheadCredit {
+    fn drop(&mut self) {
+        let mut unhandled = self.budget.lock();
+        *unhandled = unhandled.saturating_sub(self.bytes);
+        self.budget.handled.notify_all();
+    }
+}
+
+impl ReadAhead {
+    fn lock(&self) -> std::sync::MutexGuard<'_, usize> {
+        self.unhandled
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Waits until the unhandled bytes fit the budget; false once stopped.
+    fn wait_for_room(&self, stopped: &AtomicBool) -> bool {
+        let mut unhandled = self.lock();
+        while *unhandled >= READ_AHEAD_BYTES {
+            if stopped.load(Ordering::Acquire) {
+                return false;
+            }
+            unhandled = match self.handled.wait_timeout(unhandled, READ_AHEAD_STOP_POLL) {
+                Ok((guard, _)) => guard,
+                Err(poisoned) => poisoned.into_inner().0,
+            };
+        }
+        true
+    }
+
+    fn credit(self: &Arc<Self>, bytes: usize) -> ReadAheadCredit {
+        *self.lock() += bytes;
+        ReadAheadCredit {
+            budget: Arc::clone(self),
+            bytes,
+        }
+    }
+}
+
 /// Reads complete frames while retaining partial-read progress across nonblocking polls.
 pub(super) fn server_reader_thread(
     mut stream: LocalStream,
@@ -52,9 +111,11 @@ pub(super) fn server_reader_thread(
     let mut stream = EndpointReader {
         stream: &mut stream,
         stopped: should_quit,
+        read: 0,
     };
+    let read_ahead = Arc::new(ReadAhead::default());
     loop {
-        if should_quit.load(Ordering::Acquire) {
+        if should_quit.load(Ordering::Acquire) || !read_ahead.wait_for_room(should_quit) {
             break;
         }
 
@@ -68,11 +129,13 @@ pub(super) fn server_reader_thread(
         });
         match message {
             Ok(msg) => {
+                let credit = read_ahead.credit(std::mem::take(&mut stream.read));
                 if event_tx
                     .blocking_send(ClientLoopEvent::ServerMessage {
                         endpoint_id: endpoint_id.clone(),
                         generation,
                         message: Box::new(msg),
+                        credit,
                     })
                     .is_err()
                 {
@@ -104,6 +167,8 @@ pub(super) fn server_reader_thread(
 struct EndpointReader<'a> {
     stream: &'a mut LocalStream,
     stopped: &'a AtomicBool,
+    /// Bytes read since the last complete message was charged.
+    read: usize,
 }
 
 impl io::Read for EndpointReader<'_> {
@@ -113,7 +178,10 @@ impl io::Read for EndpointReader<'_> {
                 return Ok(0);
             }
             match crate::ipc::poll_local_stream_read_count(self.stream, buffer)? {
-                crate::ipc::LocalStreamReadCount::Data(count) => return Ok(count),
+                crate::ipc::LocalStreamReadCount::Data(count) => {
+                    self.read = self.read.saturating_add(count);
+                    return Ok(count);
+                }
                 crate::ipc::LocalStreamReadCount::Closed => return Ok(0),
                 crate::ipc::LocalStreamReadCount::Pending => {
                     crate::platform::wait_client_stream_readable(self.stream)?;
@@ -163,6 +231,87 @@ mod tests {
     use interprocess::local_socket::traits::Listener as _;
     use std::io::{Read as _, Write as _};
     use std::time::Instant;
+
+    #[test]
+    fn read_ahead_budget_waits_until_handled_messages_release_bytes() {
+        let budget = Arc::new(ReadAhead::default());
+        let stopped = AtomicBool::new(true); // Turns a wait into an observable refusal.
+        let small = budget.credit(READ_AHEAD_BYTES - 1);
+        assert!(budget.wait_for_room(&stopped));
+        let large = budget.credit(1);
+        assert!(!budget.wait_for_room(&stopped));
+        drop(small);
+        assert!(budget.wait_for_room(&stopped));
+        drop(large);
+        assert_eq!(*budget.lock(), 0);
+    }
+
+    #[test]
+    fn reader_stops_draining_while_large_frames_are_unhandled() {
+        let path = std::env::temp_dir().join(format!(
+            "herdr-read-ahead-{}-{}.sock",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let listener = crate::ipc::bind_private_local_listener(&path).unwrap();
+        let client = crate::ipc::connect_local_stream(&path).unwrap();
+        let mut server = listener.accept().unwrap();
+        std::fs::remove_file(path).unwrap();
+        drop(listener);
+        // Each frame is over half the budget: two unhandled frames exhaust it.
+        let frame_len = READ_AHEAD_BYTES / 2 + 1;
+        let writer = std::thread::spawn(move || {
+            for fill in 0..3u8 {
+                let message = ServerMessage::Graphics {
+                    bytes: vec![fill; frame_len],
+                };
+                protocol::write_message(&mut server, &message).unwrap();
+            }
+        });
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(256);
+        let quit = Arc::new(AtomicBool::new(false));
+        let reader_quit = Arc::clone(&quit);
+        let reader = std::thread::spawn(move || {
+            server_reader_thread(
+                client,
+                event_tx,
+                &reader_quit,
+                protocol::MAX_GRAPHICS_FRAME_SIZE,
+                endpoint::ClientEndpointId::Local,
+                1,
+                None,
+            );
+        });
+        fn next_graphics(
+            events: &mut tokio::sync::mpsc::Receiver<ClientLoopEvent>,
+        ) -> (u8, ReadAheadCredit) {
+            match events.blocking_recv() {
+                Some(ClientLoopEvent::ServerMessage {
+                    message, credit, ..
+                }) => match *message {
+                    ServerMessage::Graphics { bytes } => (bytes[0], credit),
+                    _ => panic!("unexpected server message"),
+                },
+                _ => panic!("expected a server message event"),
+            }
+        }
+        let first = next_graphics(&mut event_rx);
+        let second = next_graphics(&mut event_rx);
+        assert_eq!((first.0, second.0), (0, 1));
+        // Without the budget the third frame, already written, arrives here.
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(event_rx.try_recv().is_err());
+        drop(first);
+        let third = next_graphics(&mut event_rx);
+        assert_eq!(third.0, 2);
+        writer.join().unwrap();
+        quit.store(true, Ordering::Release);
+        drop((second, third));
+        reader.join().unwrap();
+    }
 
     #[test]
     fn upload_cancellation_preserves_pending_endpoint_download() {
@@ -226,6 +375,7 @@ mod tests {
         EndpointReader {
             stream: &mut reader_stream,
             stopped: &stopped,
+            read: 0,
         }
         .read_to_end(&mut output)
         .unwrap();
