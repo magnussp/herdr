@@ -529,7 +529,7 @@ Applications and plugins integrate through the standard Kitty graphics protocol 
 
 Popups, menus, and notifications crop images around the area they cover; the rest of each image stays visible and the covered part returns when the overlay closes. Images do not dim with dialog backgrounds.
 
-Herdr automatically chooses eligible file transports, with no application changes or environment switches. On local Unix Ghostty clients, it can send image data through temporary files instead of encoding it into terminal output. A small file-consumption probe checks support first. Other terminals, SSH-launched clients, and nested multiplexers retain inline output for this last-hop optimization.
+Herdr automatically chooses eligible file transports, with no application changes or environment switches. On local Unix Ghostty clients, it can send image data through temporary files instead of encoding it into terminal output. A small file-consumption probe in each candidate directory (the client's `$TMPDIR`, then `/tmp`) checks support first, and Herdr uses the first directory the terminal accepts. If the terminal accepts none, `herdr-client.log` records it and images stay inline. Other terminals, SSH-launched clients, and nested multiplexers retain inline output for this last-hop optimization.
 
 For eligible local clients, native RGBA images travel from server to client as paths to Herdr-owned snapshots rather than pixel bytes. Unsupported clients and failed transfers fall back to inline delivery. Remote server paths are never forwarded to the local terminal. Herdr keeps image placement, clipping, and visibility under its control.
 

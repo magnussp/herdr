@@ -54,10 +54,10 @@ pub(super) fn write_composed_frame(
                     .split(',')
                     .any(|part| matches!(part, "f=24" | "f=32" | "f=100"));
                 if file_eligible {
-                    if let Some(path) = files
-                        .probe()
-                        .and_then(|path| path.to_str().map(str::to_owned))
-                    {
+                    for path in files.probe() {
+                        let Some(path) = path.to_str() else {
+                            continue;
+                        };
                         let path =
                             base64::engine::general_purpose::STANDARD.encode(path.as_bytes());
                         write!(writer, "\x1b_Ga=q,t=t,f=32,s=1,v=1,i=1,q=2;{path}\x1b\\")?;

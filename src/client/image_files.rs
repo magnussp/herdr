@@ -2,10 +2,12 @@
 //!
 //! A returned path is published: it must stay readable until the terminal unlinks
 //! it, or the client shuts down. Never use `cleanup` to cancel a frame. This ledger
-//! does not encode pixels or accept paths from a server. A silent raw-file query
-//! gates conversion for the local Ghostty allowlist; an explicit kill switch
-//! always wins. Local writes alone do not prove support. Non-consumption disables
-//! new files for this client, without deleting files the terminal may still open.
+//! does not encode pixels or accept paths from a server. Silent raw-file queries,
+//! one per candidate temporary root, gate conversion for the local Ghostty
+//! allowlist; an explicit kill switch always wins. Local writes alone do not
+//! prove support. Only the first root the terminal consumes receives uploads.
+//! Non-consumption disables new files for this client, without deleting files
+//! the terminal may still open.
 
 use std::path::PathBuf;
 
@@ -18,8 +20,13 @@ pub(crate) struct FileTransport {
 impl FileTransport {
     #[cfg(all(test, unix))]
     pub(crate) fn for_test(root: PathBuf) -> Self {
+        Self::for_test_roots(vec![root])
+    }
+
+    #[cfg(all(test, unix))]
+    pub(crate) fn for_test_roots(roots: Vec<PathBuf>) -> Self {
         Self {
-            inner: Some(crate::platform::unix_image_files::Ledger::for_test(root)),
+            inner: Some(crate::platform::unix_image_files::Ledger::for_test(roots)),
         }
     }
 
@@ -30,17 +37,21 @@ impl FileTransport {
         }
     }
 
-    /// Once per client, return a private 1x1 RGBA query payload. The output
-    /// boundary must emit this as `a=q,t=t,f=32,s=1,v=1,q=2` before inline image
-    /// output. No real upload is converted until Ghostty consumes this file.
-    pub(crate) fn probe(&mut self) -> Option<PathBuf> {
+    /// Once per client, return private 1x1 RGBA query payloads in preference
+    /// order. The output boundary must emit each, in order, as
+    /// `a=q,t=t,f=32,s=1,v=1,q=2` before inline image output. No real upload is
+    /// converted until Ghostty consumes one of these files.
+    pub(crate) fn probe(&mut self) -> Vec<PathBuf> {
         #[cfg(unix)]
         {
-            self.inner.as_mut()?.probe()
+            self.inner
+                .as_mut()
+                .map(crate::platform::unix_image_files::Ledger::probe)
+                .unwrap_or_default()
         }
         #[cfg(not(unix))]
         {
-            None
+            Vec::new()
         }
     }
 
@@ -132,7 +143,7 @@ mod tests {
     #[test]
     fn default_is_disabled() {
         let mut transport = FileTransport::default();
-        assert!(transport.probe().is_none());
+        assert!(transport.probe().is_empty());
         assert!(transport.prepare(b"inline").is_none());
     }
 }
